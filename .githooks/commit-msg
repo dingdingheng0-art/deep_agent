@@ -1,0 +1,55 @@
+#!/bin/sh
+# commit-msg: 校验提交信息格式，并拦截低质量/AI 味过重的提交信息。
+# 由 .gitconfig 的 core.hooksPath 启用（见 README「Git 与 AI 提交检查」）。
+
+msg_file="$1"
+msg=$(grep -v '^#' "$msg_file" | sed '/^[[:space:]]*$/d')
+
+if [ -z "$msg" ]; then
+  echo "❌ 提交信息不能为空"
+  exit 1
+fi
+
+# ---------- 1. 首行格式：<type>(<scope>): <subject> ----------
+first=$(printf '%s\n' "$msg" | head -n 1)
+len=$(printf '%s' "$first" | wc -m | tr -d ' ')
+
+if [ "$len" -gt 72 ]; then
+  echo "❌ 提交信息首行过长（${len} 字符 > 72）"
+  echo "   规范: <type>(<scope>): <简短描述>"
+  echo "   当前: $first"
+  exit 1
+fi
+
+if ! printf '%s' "$first" | grep -qE '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-zA-Z0-9_/-]+\))?: .+'; then
+  echo "❌ 提交信息首行不符合规范"
+  echo ""
+  echo "   规范: <type>(<scope>): <简短描述>"
+  echo "   示例: feat(testcase): 新增 xmind 导出工具"
+  echo ""
+  echo "   type 取值: feat/fix/docs/style/refactor/perf/test/build/ci/chore/revert"
+  echo "   当前: $first"
+  exit 1
+fi
+
+# ---------- 2. AI 味 / 占位符检查 ----------
+if printf '%s\n' "$msg" | grep -qiE '^(generated with|copilot|claude|chatgpt|ai[- ]generated|as an ai)'; then
+  echo "❌ 检测到 AI 工具署名/水印行，提交前请删除"
+  echo "   （内容可以是 AI 辅助生成，但不要在提交信息里保留工具水印）"
+  exit 1
+fi
+
+if printf '%s\n' "$msg" | grep -qiE 'update code|fix bug|minor changes|asdf|test test|add some|暂时|修改一下'; then
+  echo "❌ 提交信息过于笼统，无法说明本次改动的意图"
+  echo "   当前: $first"
+  echo "   请描述「改了什么」和「为什么」"
+  exit 1
+fi
+
+if printf '%s\n' "$msg" | grep -qE '^(WIP|wip|test|\.+)$'; then
+  echo "❌ 检测到无意义提交信息（如: WIP / test）"
+  echo "   请使用规范格式: <type>(<scope>): <简短描述>"
+  exit 1
+fi
+
+exit 0

@@ -1,0 +1,45 @@
+# ---- 密钥与本地配置 ----
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# ---- 第三方嵌套仓库（langchain-ai/deep-agents-ui 上游检出）----
+deep-agents-ui/
+
+# ---- 依赖 ----
+.venv/
+venv/
+env/
+node_modules/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.uv/
+
+# ---- 构建/测试缓存 ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.langgraph_api/
+tsconfig.tsbuildinfo
+
+# ---- IDE ----
+.idea/
+.vscode/
+.cursor/
+
+# ---- 运行时产出 / 用户上传数据 ----
+workspace/
+smoke_test/
+testcase_agent/workspaces/
+testcase_agent/outputs/
+testcase_agent/upload_staging/
+*.log
+logs/
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini

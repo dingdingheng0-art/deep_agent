@@ -1,0 +1,7 @@
+{
+  "dependencies": ["./requirements.txt"],
+  "graphs": {
+    "research": "./langgraph_agent.py:agent",
+    "testcase_agent": "./deep_agents/testcase_agent/agent.py:make_agent"
+  }
+}

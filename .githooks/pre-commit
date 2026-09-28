@@ -1,0 +1,64 @@
+#!/bin/sh
+# pre-commit: 提交前扫描暂存区，阻止密钥/大文件误入版本库。
+# 由 .gitconfig 的 core.hooksPath 启用（见 README「Git 与 AI 提交检查」）。
+
+set -e
+
+fail=0
+
+# ---------- 1. 密钥扫描 ----------
+# 匹配常见服务商密钥前缀：Anthropic/OpenAI(sk-)、GitHub(ghp_/gho_/ghs_)、AWS(AKIA)、
+# 阿里云/通义(sk-ws-)、Slack(xox)、私钥块。
+PATTERN='sk-[A-Za-z0-9._-]\{16,\}|ghp_[A-Za-z0-9]\{20,\}|gho_[A-Za-z0-9]\{20,\}|ghs_[A-Za-z0-9]\{20,\}\|AKIA[0-9A-Z]\{16\}\|xox[baprs]-[A-Za-z0-9-]\{10,\}'
+
+# 只检查"新增行"，避免历史代码中的旧问题反复阻塞提交。
+staged_diff=$(git diff --cached --no-color -U0)
+
+leaks=$(printf '%s\n' "$staged_diff" \
+  | grep -E '^\+[^+]' \
+  | grep -E "$PATTERN" \
+  | sed 's/^+//' \
+  | cut -c1-80 || true)
+
+if [ -n "$leaks" ]; then
+  echo "❌ 提交被阻止：暂存内容中检测到疑似密钥"
+  echo ""
+  printf '%s\n' "$leaks" | sed 's/^/    /'
+  echo ""
+  echo "   处理方式："
+  echo "     - 真实密钥移入 .env（已被 .gitignore 排除），代码里改用 os.environ 读取"
+  echo "     - 文档/示例中改为占位符 <your-key>"
+  echo "     - 确认是误报时，用 git commit --no-verify 跳过"
+  exit 1
+fi
+
+# ---------- 2. .env 保护 ----------
+# 按"文件名"判断，而不是 diff 正文：否则 .gitignore 里那行 ".env" 字面量会误触发。
+# .env.example 是合法的配置模板，必须放行。
+env_leak=$(git diff --cached --name-only --diff-filter=ACM \
+  | grep -E '(^|/)\.env$' || true)
+
+if [ -n "$env_leak" ]; then
+  echo "❌ 提交被阻止：检测到 .env 试图进入版本库（该文件含真实密钥）"
+  printf '%s\n' "$env_leak" | sed 's/^/    /'
+  echo "   如需共享配置模板，请提交 .env.example"
+  exit 1
+fi
+
+# ---------- 3. 大文件拦截 ----------
+large=$(git diff --cached --name-only --diff-filter=ACM \
+  | while read -r f; do
+      [ -f "$f" ] || continue
+      size=$(wc -c < "$f" | tr -d ' ')
+      [ "$size" -gt 5242880 ] && echo "$f ($((size / 1024 / 1024))MB)"
+    done || true)
+
+if [ -n "$large" ]; then
+  echo "❌ 提交被阻止：以下文件超过 5MB"
+  printf '%s\n' "$large" | sed 's/^/    /'
+  echo ""
+  echo "   请改用 Git LFS，或确认是否属于构建产物/数据文件并加入 .gitignore"
+  exit 1
+fi
+
+exit 0

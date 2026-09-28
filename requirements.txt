@@ -1,0 +1,11 @@
+deepagents
+langchain
+langchain-anthropic
+fastmcp
+pytest
+python-dotenv
+tavily-python
+docling-serve
+openpyxl
+httpx
+jsonschema
