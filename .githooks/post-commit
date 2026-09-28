@@ -1,3 +1,0 @@
-# post-commit: 本地提示「AI 提交检查」是否可跑（需 Cursor/Claude Code 环境）。
-# 纯提示性，不阻断任何操作。
-exit 0
