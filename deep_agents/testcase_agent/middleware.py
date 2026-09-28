@@ -77,17 +77,25 @@ class WorkspaceFilesystemMiddleware(AgentMiddleware):
 
 
 class DoclingParseMiddleware(AgentMiddleware):
-    """把 uploaded_files 中的 base64 文件解析为 Markdown 并注入 state.files。"""
+    """把 uploaded_files 中的 base64 文件解析为 Markdown 并写入虚拟文件系统。
+
+    解析结果通过注入的 ``backend`` 落盘到 ``/uploads/``（与 agent 的
+    read_file/ls 等工具读取的是同一个 backend），而不是返回
+    ``state["files"]``：``files`` channel 仅在 backend 为 StateBackend 时才存在，
+    本 agent 使用真实磁盘的 CompositeBackend(FilesystemBackend)，返回该字段会被丢弃。
+    """
 
     name = "docling_parse"
 
     def __init__(
         self,
+        backend: Any,
         base_url: str | None = None,
         api_key: str | None = None,
         poll_interval: float = 2.0,
         timeout: float = 600.0,
     ) -> None:
+        self.backend = backend
         self.base_url = (
             base_url
             or os.environ.get("DOCLING_SERVE_URL")
@@ -147,8 +155,19 @@ class DoclingParseMiddleware(AgentMiddleware):
                 )
             for f, result in zip(ready, gathered, strict=True):
                 converted[f["filename"]] = result
-        results = [converted[f["filename"]] for f in uploaded]
-        return self._build_update([f["filename"] for f in uploaded], results)
+        filenames = [f["filename"] for f in uploaded]
+        results = [converted[name] for name in filenames]
+        # 写入 backend（与 ls/read_file 走同一个 VFS）；同时清空 uploaded_files 通道
+        written_notes = await self._write_to_backend(filenames, results)
+        note_text = (
+            "📎 用户上传的文件已解析完成：\n"
+            + "\n".join(written_notes)
+            + "\n请使用 read_file 读取上述 /uploads/ 下的 Markdown 文件作为需求依据。"
+        )
+        return {
+            "uploaded_files": [],
+            "messages": [HumanMessage(content=note_text)],
+        }
 
     def before_agent(self, state: dict[str, Any], runtime: Any) -> dict[str, Any] | None:
         uploaded = self._collect_uploaded(state)
@@ -169,7 +188,18 @@ class DoclingParseMiddleware(AgentMiddleware):
                     )
                 except Exception as e:  # noqa: BLE001 - 单文件失败不阻断其他文件
                     results.append(e)
-        return self._build_update([f["filename"] for f in uploaded], results)
+        written_notes = self._write_to_backend_sync(
+            [f["filename"] for f in uploaded], results
+        )
+        note_text = (
+            "📎 用户上传的文件已解析完成：\n"
+            + "\n".join(written_notes)
+            + "\n请使用 read_file 读取上述 /uploads/ 下的 Markdown 文件作为需求依据。"
+        )
+        return {
+            "uploaded_files": [],
+            "messages": [HumanMessage(content=note_text)],
+        }
 
     # ------------------------------------------------------------- docling 调用
 
@@ -272,31 +302,41 @@ class DoclingParseMiddleware(AgentMiddleware):
     # ------------------------------------------------------------- 状态更新构造
 
     @staticmethod
-    def _build_update(
-        filenames: list[str], results: list[str | BaseException]
-    ) -> dict[str, Any]:
-        files_update: dict[str, Any] = {}
+    def _render_note(filename: str, result: str | BaseException) -> tuple[str, str, str]:
+        """返回 (virtual_path, content, note_line)。"""
+        stem = PurePath(filename).stem or "upload"
+        if isinstance(result, BaseException):
+            path = f"/uploads/{stem}.error.md"
+            content = f"# 文件解析失败\n\n原始文件：{filename}\n\n错误：{result}"
+            note = f"❌ `{filename}` 解析失败（{result}），详情见 `{path}`"
+        else:
+            path = f"/uploads/{stem}.md"
+            content = result
+            note = f"✅ `{filename}` → `{path}`（{len(result)} 字符）"
+        return path, content, note
+
+    async def _write_to_backend(
+        self, filenames: list[str], results: list[str | BaseException]
+    ) -> list[str]:
+        """异步路径：把每个文件直接写入注入的 backend，并返回提示行列表。"""
         notes: list[str] = []
         for filename, result in zip(filenames, results, strict=True):
-            stem = PurePath(filename).stem or "upload"
-            if isinstance(result, BaseException):
-                path = f"/uploads/{stem}.error.md"
-                files_update[path] = {
-                    "content": f"# 文件解析失败\n\n原始文件：{filename}\n\n错误：{result}",
-                    "encoding": "utf-8",
-                }
-                notes.append(f"❌ `{filename}` 解析失败（{result}），详情见 `{path}`")
-            else:
-                path = f"/uploads/{stem}.md"
-                files_update[path] = {"content": result, "encoding": "utf-8"}
-                notes.append(f"✅ `{filename}` → `{path}`（{len(result)} 字符）")
-        note_text = (
-            "📎 用户上传的文件已解析完成：\n"
-            + "\n".join(notes)
-            + "\n请使用 read_file 读取上述 /uploads/ 下的 Markdown 文件作为需求依据。"
-        )
-        return {
-            "files": files_update,
-            "uploaded_files": [],
-            "messages": [HumanMessage(content=note_text)],
-        }
+            path, content, note = self._render_note(filename, result)
+            write_result = await self.backend.awrite(path, content)
+            if write_result.error:
+                note = f"❌ `{filename}` 写入失败：{write_result.error}"
+            notes.append(note)
+        return notes
+
+    def _write_to_backend_sync(
+        self, filenames: list[str], results: list[str | BaseException]
+    ) -> list[str]:
+        """同步路径：与异步分支逻辑一致，但走同步 write。"""
+        notes: list[str] = []
+        for filename, result in zip(filenames, results, strict=True):
+            path, content, note = self._render_note(filename, result)
+            write_result = self.backend.write(path, content)
+            if write_result.error:
+                note = f"❌ `{filename}` 写入失败：{write_result.error}"
+            notes.append(note)
+        return notes

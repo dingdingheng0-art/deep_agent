@@ -106,7 +106,8 @@ def _build_agent():
         model=MODEL,
         tools=[export_excel, export_xmind],
         system_prompt=MAIN_PROMPT,
-        middleware=[WorkspaceFilesystemMiddleware(WORKSPACE_DIR), DoclingParseMiddleware(), TodoListMiddleware()],
+        # DoclingParseMiddleware 需持有 backend，才能把解析结果写进 agent 读到的同一 VFS
+        middleware=[WorkspaceFilesystemMiddleware(WORKSPACE_DIR), DoclingParseMiddleware(backend), TodoListMiddleware()],
         subagents=SUBAGENTS,
         backend=backend,
         skills=[SKILLS_SOURCE],
