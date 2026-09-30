@@ -340,3 +340,160 @@ class DoclingParseMiddleware(AgentMiddleware):
                 note = f"❌ `{filename}` 写入失败：{write_result.error}"
             notes.append(note)
         return notes
+
+
+# --------------------------------------------------------------------------------
+# WriteGuardMiddleware：截断检测 + 工具错误自解释化
+# --------------------------------------------------------------------------------
+
+
+class WriteGuardMiddleware(AgentMiddleware):
+    """防护中间件：处理 max_tokens 截断和工具参数错误。
+
+    a) wrap_model_call / awrap_model_call：输出被截断时，向 AI 提示分段写入策略。
+    b) wrap_tool_call / awrap_tool_call：把 write_file/edit_file/append_file 的
+       参数错误改写为可执行指引。
+
+    必须同时提供 sync/async 实现：langgraph 服务端走 ainvoke/astream，
+    缺少 awrap_* 会触发 NotImplementedError。
+    """
+
+    name = "write_guard"
+
+    _WRITE_TOOLS = frozenset({"write_file", "edit_file", "append_file"})
+    _TRUNCATE_PATTERNS = ("length", "max_tokens")
+    _ERROR_PATTERNS = (
+        "Field required",
+        "validation",
+        "not valid JSON",
+        "missing required",
+    )
+    _GUARD_TEXT = (
+        "\n\n[系统提示] 上一次输出因达到 max_tokens 被截断，"
+        "工具参数可能不完整。\n"
+        "不要原样重试：把内容拆成更小的批次，用 append_file 分段写入（每段 ≤2000 字符）。\n"
+        "首次写入用 write_file，后续追加用 append_file。"
+    )
+    _FIX_TEXT = (
+        "错误：参数缺失或被截断（上次输出不完整导致）。\n"
+        "修正策略：\n"
+        "1. 缩短本次写入内容（建议每段 ≤2000 字符）。\n"
+        "2. 长文档改用 append_file 分段追加（首次用 write_file 写开头，后续用 append_file 追加）。\n"
+        "3. 禁止在同一轮里并行调用多个 append_file 写入同一文件。"
+    )
+
+    # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _extract_ai_message(response: Any) -> Any | None:
+        """从 ModelResponse / AIMessage / ExtendedModelResponse 取出 AIMessage。"""
+        from langchain_core.messages import AIMessage
+
+        if isinstance(response, AIMessage):
+            return response
+        result = getattr(response, "result", None)
+        if isinstance(result, list) and result:
+            first = result[0]
+            if isinstance(first, AIMessage):
+                return first
+        model_response = getattr(response, "model_response", None)
+        if model_response is not None:
+            return WriteGuardMiddleware._extract_ai_message(model_response)
+        return None
+
+    def _apply_truncation_guard(self, response: Any) -> Any:
+        """若输出因 max_tokens 截断且含工具调用，在 AIMessage content 前部注入提示。"""
+        from dataclasses import replace
+
+        from langchain_core.messages import AIMessage
+
+        ai_msg = self._extract_ai_message(response)
+        if ai_msg is None:
+            return response
+
+        metadata = getattr(ai_msg, "response_metadata", None) or {}
+        finish_reason = metadata.get("finish_reason")
+        stop_reason = metadata.get("stop_reason")
+        is_truncated = (
+            finish_reason in self._TRUNCATE_PATTERNS
+            or stop_reason in self._TRUNCATE_PATTERNS
+        )
+        if not is_truncated:
+            return response
+
+        tool_calls = getattr(ai_msg, "tool_calls", None) or []
+        content = getattr(ai_msg, "content", None)
+        has_tool_call = bool(tool_calls)
+        if not has_tool_call and isinstance(content, list):
+            has_tool_call = any(
+                (isinstance(item, dict) and item.get("type") == "tool_call")
+                or getattr(item, "type", None) == "tool_call"
+                for item in content
+            )
+        if not has_tool_call:
+            return response
+
+        if isinstance(content, list):
+            new_content: list[Any] = [{"type": "text", "text": self._GUARD_TEXT}, *content]
+        elif isinstance(content, str):
+            new_content = self._GUARD_TEXT + content
+        else:
+            new_content = self._GUARD_TEXT
+
+        patched = ai_msg.model_copy(update={"content": new_content})
+
+        # 保持原返回类型结构
+        if isinstance(response, AIMessage):
+            return patched
+        result = getattr(response, "result", None)
+        if isinstance(result, list) and result:
+            new_result = [patched, *result[1:]]
+            return replace(response, result=new_result)
+        model_response = getattr(response, "model_response", None)
+        if model_response is not None:
+            patched_mr = self._apply_truncation_guard(model_response)
+            return replace(response, model_response=patched_mr)
+        return response
+
+    def _rewrite_tool_error(self, request: Any, result: Any) -> Any:
+        """把 write/edit/append_file 的参数校验错误改写成可执行指引。"""
+        from langchain_core.messages import ToolMessage
+
+        tool_call = getattr(request, "tool_call", None) or {}
+        if isinstance(tool_call, dict):
+            tool_name = tool_call.get("name") or ""
+        else:
+            tool_name = getattr(tool_call, "name", "") or ""
+        if tool_name not in self._WRITE_TOOLS:
+            return result
+        if not isinstance(result, ToolMessage):
+            return result
+
+        content_str = str(result.content or "")
+        if not any(pat in content_str for pat in self._ERROR_PATTERNS):
+            return result
+
+        return ToolMessage(
+            content=self._FIX_TEXT,
+            tool_call_id=result.tool_call_id,
+            name=result.name or tool_name,
+            status=getattr(result, "status", None) or "error",
+        )
+
+    # ------------------------------------------------------------------ hooks
+
+    def wrap_model_call(self, request: Any, handler: Any) -> Any:
+        response = handler(request)
+        return self._apply_truncation_guard(response)
+
+    async def awrap_model_call(self, request: Any, handler: Any) -> Any:
+        response = await handler(request)
+        return self._apply_truncation_guard(response)
+
+    def wrap_tool_call(self, request: Any, handler: Any) -> Any:
+        result = handler(request)
+        return self._rewrite_tool_error(request, result)
+
+    async def awrap_tool_call(self, request: Any, handler: Any) -> Any:
+        result = await handler(request)
+        return self._rewrite_tool_error(request, result)
